@@ -30,8 +30,6 @@ NebulaStream provides a sleek, local web interface for browsing and streaming an
 | :--- | :--- | :--- |
 | ![Home](https://github.com/VirtueCore/NebulaStream/blob/177dcc0141fd1b3edd51e3b39a6a33a5e9099152/2026-08-16_15-11.png) | ![Player](https://github.com/VirtueCore/NebulaStream/blob/177dcc0141fd1b3edd51e3b39a6a33a5e9099152/2026-08-16_15-20.png) | ![Details](https://github.com/VirtueCore/NebulaStream/blob/177dcc0141fd1b3edd51e3b39a6a33a5e9099152/2026-08-16_15-05.png) |
 
-> Create a `screenshots/` folder in the repository root and place your images there.
-
 ---
 
 ## 🚀 Quick Start
