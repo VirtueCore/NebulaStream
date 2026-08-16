@@ -1,0 +1,10 @@
+services:
+  anime-resolver:
+    build:
+      context: ./anime-resolver
+    restart: unless-stopped
+    ports:
+      - "${PORT:-7001}:7001"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=7001
