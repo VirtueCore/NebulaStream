@@ -5,15 +5,15 @@ import re
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote, unquote, urljoin, urlparse
-from pathlib import Path
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -26,7 +26,7 @@ class Config:
     CACHE_TTL_CATALOG = int(os.getenv("CACHE_TTL_CATALOG", "3600"))
     DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     ANILIST_GQL = "https://graphql.anilist.co"
-    MEGAVID_API = "https://megavid.buzz/api/mal/{mal_id}/{episode}/{lang}"
+    MEGAVID_API = "https://megavid.buzz/api/ani/{anilist_id}/{episode}/{lang}"
     MEGAVID_REFERER = "https://megavid.buzz/"
     STATIC_DIR = Path(__file__).parent / "static"
     TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -37,7 +37,6 @@ class AppState:
     catalog_cache: Dict[str, dict] = {}
     home_cache: Optional[dict] = None
     home_cache_ts: float = 0.0
-    mal_id_cache: Dict[str, int] = {}
     cache_lock = asyncio.Lock()
     in_flight: Dict[str, asyncio.Task] = {}
 
@@ -67,7 +66,6 @@ async def _fetch_media_list(variables: dict) -> tuple:
         Page(page: $page, perPage: $perPage) {{
             media({genre_arg}sort: $sort, type: ANIME, format: $format, season: $season, seasonYear: $seasonYear, status: $status) {{
                 id
-                idMal
                 title {{ romaji english }}
                 coverImage {{ large }}
                 bannerImage
@@ -114,7 +112,6 @@ async def _fetch_media_list(variables: dict) -> tuple:
         title = m["title"].get("english") or m["title"].get("romaji") or "Unknown"
         metas.append({
             "id": m["id"],
-            "mal_id": m.get("idMal"),
             "title": title,
             "poster": m["coverImage"]["large"],
             "banner": m.get("bannerImage"),
@@ -162,46 +159,52 @@ async def fetch_home_data() -> dict:
     state.home_cache_ts = now
     return results
 
-async def get_mal_id(anilist_id: int) -> Optional[int]:
-    cache_key = str(anilist_id)
-    if cache_key in state.mal_id_cache:
-        return state.mal_id_cache[cache_key]
-    query = """
-    query ($id: Int) {
-        Media(id: $id, type: ANIME) {
-            idMal
-        }
-    }
-    """
-    try:
-        resp = await state.client.post(
-            Config.ANILIST_GQL,
-            json={"query": query, "variables": {"id": anilist_id}},
-            headers={"Content-Type": "application/json"},
-            timeout=10.0
-        )
-        data = resp.json().get("data", {}).get("Media", {})
-        mal_id = data.get("idMal")
-        if mal_id:
-            state.mal_id_cache[cache_key] = mal_id
-            return mal_id
-    except:
-        pass
-    return None
-
-async def fetch_megavid(mal_id: int, episode: int, lang: str) -> Optional[dict]:
-    url = Config.MEGAVID_API.format(mal_id=mal_id, episode=episode, lang=lang)
+async def fetch_megavid(anilist_id: int, episode: int, lang: str) -> Optional[dict]:
+    url = Config.MEGAVID_API.format(anilist_id=anilist_id, episode=episode, lang=lang)
     headers = {"User-Agent": Config.DEFAULT_UA, "Referer": Config.MEGAVID_REFERER}
-    try:
-        resp = await state.client.get(url, headers=headers, timeout=15.0)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if not data.get("success"):
-            return None
-        return data
-    except:
-        return None
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            resp = await state.client.get(url, headers=headers, timeout=30.0)
+
+            if resp.status_code != 200:
+                last_error = f"HTTP {resp.status_code}"
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                return None
+
+            data = resp.json()
+            payload = data.get("data") if isinstance(data.get("data"), dict) else data
+
+            # Check alternative keys in case of API schema shifts
+            source = (
+                data.get("source") or payload.get("source") or
+                data.get("file") or payload.get("file") or
+                data.get("link") or payload.get("link")
+            )
+
+            if not source:
+                logger.warning(
+                    f"No stream found for ani={anilist_id} ep={episode} ({lang}). "
+                    f"Keys returned -> Root: {list(data.keys())} | Payload: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}"
+                )
+                # Immediately return None to avoid hitting the endpoint repeatedly when no media source exists
+                return None
+
+            if data.get("tracks") is None and isinstance(payload.get("tracks"), list):
+                data["tracks"] = payload["tracks"]
+
+            data["source"] = source
+            return data
+
+        except (httpx.HTTPError, ValueError) as e:
+            last_error = str(e)
+            await asyncio.sleep(1 + attempt)
+
+    logger.warning(f"Megavid fetch failed for ani={anilist_id} ep={episode} lang={lang}: {last_error}")
+    return None
 
 def build_headers(target_url: str, referer: str, incoming_headers: Optional[dict] = None) -> dict:
     domain = urlparse(target_url).netloc
@@ -252,8 +255,11 @@ async def proxy_subtitle(target_url: str):
 # ------------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    state.client = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(10.0, read=30.0),
-                                     limits=httpx.Limits(max_keepalive_connections=100, max_connections=300))
+    state.client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(10.0, read=30.0),
+        limits=httpx.Limits(max_keepalive_connections=100, max_connections=300)
+    )
     logger.info("NebulaStream started.")
     yield
     await state.client.aclose()
@@ -290,7 +296,7 @@ async def api_search(q: str):
     query ($search: String) {
         Page(page: 1, perPage: 20) {
             media(search: $search, type: ANIME) {
-                id idMal title { romaji english } coverImage { large } episodes seasonYear genres format status averageScore
+                id title { romaji english } coverImage { large } episodes seasonYear genres format status averageScore
             }
         }
     }
@@ -339,7 +345,6 @@ async def anime_details(anilist_id: str):
     query ($id: Int) {
         Media(id: $id, type: ANIME) {
             id
-            idMal
             title { romaji english native }
             coverImage { large }
             bannerImage
@@ -391,7 +396,6 @@ async def anime_details(anilist_id: str):
     if not media:
         raise HTTPException(status_code=404, detail="Anime not found")
 
-    # Process recommendations
     recs = []
     for edge in media.get("recommendations", {}).get("edges", []):
         node = edge.get("node", {}).get("mediaRecommendation", {})
@@ -407,7 +411,6 @@ async def anime_details(anilist_id: str):
             })
     media["recommendations"] = recs
 
-    # Process relations (seasons, sequels, etc.)
     relations = []
     for edge in media.get("relations", {}).get("edges", []):
         rel_type = edge.get("relationType", "")
@@ -426,29 +429,64 @@ async def anime_details(anilist_id: str):
 
     return media
 
-# Stream endpoint
 @app.get("/stream/{anilist_id}/{episode}")
-async def stream_endpoint(anilist_id: str, episode: int, req: Request):
-    mal_id = await get_mal_id(int(anilist_id))
-    if not mal_id:
+async def stream_endpoint(
+    anilist_id: str,
+    episode: int,
+    req: Request
+):
+    clean = anilist_id.replace("anilist:", "")
+    try:
+        aid = int(clean)
+    except ValueError:
+        logger.warning(f"Invalid AniList ID: {anilist_id}")
         return {"streams": []}
-    streams = []
+
     base = str(req.base_url).rstrip("/")
-    for lang in ("sub", "dub"):
-        data = await fetch_megavid(mal_id, episode, lang)
+
+    async def fetch_stream_for_lang(lang: str) -> Optional[dict]:
+        data = await fetch_megavid(aid, episode, lang)
         if not data:
-            continue
-        proxy_url = f"{base}/proxy/m3u8?url={quote(data['source'])}&referer={quote(Config.MEGAVID_REFERER)}"
+            return None
+
+        source = data.get("source")
+        if not source:
+            return None
+
+        proxy_url = f"{base}/proxy/m3u8?url={quote(source)}&referer={quote(Config.MEGAVID_REFERER)}"
         label = "English Dub" if lang == "dub" else "Japanese Sub"
         stream_obj = {"name": label, "url": proxy_url}
-        if data.get("tracks"):
-            stream_obj["subtitles"] = [{"url": f"{base}/proxy/sub?url={quote(t['file'])}", "lang": t.get("label","eng")}
-                                       for t in data["tracks"] if t.get("file")]
+
+        tracks = data.get("tracks") or []
+        if tracks:
+            stream_obj["subtitles"] = [
+                {
+                    "url": f"{base}/proxy/sub?url={quote(t['file'])}",
+                    "lang": t.get("label", "eng")
+                }
+                for t in tracks if t.get("file")
+            ]
+
         hints = {}
-        if data.get("intro"): hints["skipIntroTimestamps"] = [data["intro"]["start"], data["intro"]["end"]]
-        if data.get("outro"): hints["skipOutroTimestamps"] = [data["outro"]["start"], data["outro"]["end"]]
-        if hints: stream_obj["behaviorHints"] = hints
-        streams.append(stream_obj)
+        intro = data.get("intro")
+        outro = data.get("outro")
+
+        if intro and isinstance(intro, dict) and "start" in intro and "end" in intro:
+            hints["skipIntroTimestamps"] = [intro["start"], intro["end"]]
+        if outro and isinstance(outro, dict) and "start" in outro and "end" in outro:
+            hints["skipOutroTimestamps"] = [outro["start"], outro["end"]]
+
+        if hints:
+            stream_obj["behaviorHints"] = hints
+
+        return stream_obj
+
+    # Fetch sub and dub in parallel directly using AniList ID
+    sub_task = asyncio.create_task(fetch_stream_for_lang("sub"))
+    dub_task = asyncio.create_task(fetch_stream_for_lang("dub"))
+    sub_stream, dub_stream = await asyncio.gather(sub_task, dub_task)
+
+    streams = [s for s in (sub_stream, dub_stream) if s is not None]
     return {"streams": streams}
 
 # Proxy routes
@@ -463,7 +501,8 @@ async def proxy_m3u8(url: str, referer: str, req: Request):
     is_variant = False
     for line in lines:
         stripped = line.strip()
-        if not stripped: continue
+        if not stripped:
+            continue
         if stripped.startswith("#"):
             if "#EXT-X-STREAM-INF" in stripped or "#EXT-I-FRAME-STREAM-INF" in stripped:
                 is_variant = True
