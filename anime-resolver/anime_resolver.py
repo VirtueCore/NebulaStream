@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("nebulastream")
 
+
 class Config:
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", "7001"))
@@ -31,6 +32,7 @@ class Config:
     STATIC_DIR = Path(__file__).parent / "static"
     TEMPLATES_DIR = Path(__file__).parent / "templates"
 
+
 class AppState:
     client: Optional[httpx.AsyncClient] = None
     stream_cache: Dict[str, dict] = {}
@@ -40,7 +42,9 @@ class AppState:
     cache_lock = asyncio.Lock()
     in_flight: Dict[str, asyncio.Task] = {}
 
+
 state = AppState()
+
 
 # ------------------------------------------------------------------------------
 def get_current_season():
@@ -55,6 +59,7 @@ def get_current_season():
     else:
         season = "FALL"
     return season, year
+
 
 async def _fetch_media_list(variables: dict) -> tuple:
     has_genre = bool(variables.get("genre"))
@@ -128,6 +133,7 @@ async def _fetch_media_list(variables: dict) -> tuple:
         })
     return metas, has_next
 
+
 async def fetch_home_data() -> dict:
     now = time.time()
     if state.home_cache and (now - state.home_cache_ts < 1800):
@@ -159,9 +165,16 @@ async def fetch_home_data() -> dict:
     state.home_cache_ts = now
     return results
 
+
 async def fetch_megavid(anilist_id: int, episode: int, lang: str) -> Optional[dict]:
     url = Config.MEGAVID_API.format(anilist_id=anilist_id, episode=episode, lang=lang)
-    headers = {"User-Agent": Config.DEFAULT_UA, "Referer": Config.MEGAVID_REFERER}
+    headers = {
+        "User-Agent": Config.DEFAULT_UA,
+        "Referer": Config.MEGAVID_REFERER,
+        "Origin": "https://megavid.buzz",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     last_error = None
 
     for attempt in range(3):
@@ -176,6 +189,15 @@ async def fetch_megavid(anilist_id: int, episode: int, lang: str) -> Optional[di
                 return None
 
             data = resp.json()
+
+            # Explicit failure from upstream
+            if data.get("success") is False:
+                logger.warning(
+                    f"Upstream returned failure for ani={anilist_id} ep={episode} ({lang}): {data}"
+                )
+                # Do not retry on 403/forbidden immediately; return None and let cache decide.
+                return None
+
             payload = data.get("data") if isinstance(data.get("data"), dict) else data
 
             # Check alternative keys in case of API schema shifts
@@ -188,9 +210,8 @@ async def fetch_megavid(anilist_id: int, episode: int, lang: str) -> Optional[di
             if not source:
                 logger.warning(
                     f"No stream found for ani={anilist_id} ep={episode} ({lang}). "
-                    f"Keys returned -> Root: {list(data.keys())} | Payload: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}"
+                    f"Full response: {data}"
                 )
-                # Immediately return None to avoid hitting the endpoint repeatedly when no media source exists
                 return None
 
             if data.get("tracks") is None and isinstance(payload.get("tracks"), list):
@@ -205,6 +226,7 @@ async def fetch_megavid(anilist_id: int, episode: int, lang: str) -> Optional[di
 
     logger.warning(f"Megavid fetch failed for ani={anilist_id} ep={episode} lang={lang}: {last_error}")
     return None
+
 
 def build_headers(target_url: str, referer: str, incoming_headers: Optional[dict] = None) -> dict:
     domain = urlparse(target_url).netloc
@@ -224,6 +246,7 @@ def build_headers(target_url: str, referer: str, incoming_headers: Optional[dict
                 headers[k.capitalize()] = v
     return headers
 
+
 async def fetch_upstream_m3u8(target_url: str, ref_header: str) -> str:
     headers = build_headers(target_url, ref_header)
     for _ in range(3):
@@ -233,8 +256,10 @@ async def fetch_upstream_m3u8(target_url: str, ref_header: str) -> str:
         await asyncio.sleep(0.5)
     raise HTTPException(502, "Upstream M3U8 fetch failed")
 
+
 async def proxy_segment(target_url: str, ref_header: str, req: Request):
     headers = build_headers(target_url, ref_header, dict(req.headers))
+
     async def chunk_generator():
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=60.0)) as client:
             async with client.stream("GET", target_url, headers=headers, follow_redirects=True) as resp:
@@ -242,13 +267,78 @@ async def proxy_segment(target_url: str, ref_header: str, req: Request):
                     raise HTTPException(resp.status_code, "Segment fetch failed")
                 async for chunk in resp.aiter_bytes(chunk_size=65536):
                     yield chunk
+
     return StreamingResponse(chunk_generator(), status_code=200, media_type="video/mp2t",
                              headers={"Access-Control-Allow-Origin": "*", "Accept-Ranges": "bytes"})
+
 
 async def proxy_subtitle(target_url: str):
     headers = {"User-Agent": Config.DEFAULT_UA, "Referer": Config.MEGAVID_REFERER}
     resp = await state.client.get(target_url, headers=headers)
     return Response(content=resp.text, media_type="text/vtt", headers={"Access-Control-Allow-Origin": "*"})
+
+
+# ------------------------------------------------------------------------------
+# Stream cache helper
+# ------------------------------------------------------------------------------
+async def _fetch_and_cache_stream(anilist_id: int, episode: int, base: str, cache_key: str) -> dict:
+    """Fetch stream data for both sub and dub, build response, and cache it."""
+    async def fetch_stream_for_lang(lang: str) -> Optional[dict]:
+        data = await fetch_megavid(anilist_id, episode, lang)
+        if not data:
+            return None
+
+        source = data.get("source")
+        if not source:
+            return None
+
+        proxy_url = f"{base}/proxy/m3u8?url={quote(source)}&referer={quote(Config.MEGAVID_REFERER)}"
+        label = "English Dub" if lang == "dub" else "Japanese Sub"
+        stream_obj = {"name": label, "url": proxy_url}
+
+        tracks = data.get("tracks") or []
+        if tracks:
+            stream_obj["subtitles"] = [
+                {
+                    "url": f"{base}/proxy/sub?url={quote(t['file'])}",
+                    "lang": t.get("label", "eng")
+                }
+                for t in tracks if t.get("file")
+            ]
+
+        hints = {}
+        intro = data.get("intro")
+        outro = data.get("outro")
+
+        if intro and isinstance(intro, dict) and "start" in intro and "end" in intro:
+            hints["skipIntroTimestamps"] = [intro["start"], intro["end"]]
+        if outro and isinstance(outro, dict) and "start" in outro and "end" in outro:
+            hints["skipOutroTimestamps"] = [outro["start"], outro["end"]]
+
+        if hints:
+            stream_obj["behaviorHints"] = hints
+
+        return stream_obj
+
+    sub_task = asyncio.create_task(fetch_stream_for_lang("sub"))
+    dub_task = asyncio.create_task(fetch_stream_for_lang("dub"))
+    sub_stream, dub_stream = await asyncio.gather(sub_task, dub_task)
+
+    streams = [s for s in (sub_stream, dub_stream) if s is not None]
+    payload = {"streams": streams}
+
+    # Choose TTL: if we found no streams, cache for a shorter time to allow quick retries
+    ttl = Config.CACHE_TTL if streams else 300
+
+    async with state.cache_lock:
+        state.stream_cache[cache_key] = {
+            "ts": time.time(),
+            "payload": payload,
+            "ttl": ttl,
+        }
+
+    return payload
+
 
 # ------------------------------------------------------------------------------
 # FastAPI app
@@ -264,8 +354,10 @@ async def lifespan(app: FastAPI):
     yield
     await state.client.aclose()
 
+
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=Config.STATIC_DIR), name="static")
+
 
 # ------------------------------------------------------------------------------
 # API Routes
@@ -273,6 +365,7 @@ app.mount("/static", StaticFiles(directory=Config.STATIC_DIR), name="static")
 @app.get("/api/home")
 async def home():
     return await fetch_home_data()
+
 
 @app.get("/api/catalog")
 async def api_catalog(genre: Optional[str] = None, page: int = 1, perPage: int = 30, sort: str = "TRENDING_DESC"):
@@ -282,6 +375,7 @@ async def api_catalog(genre: Optional[str] = None, page: int = 1, perPage: int =
     metas, has_next = await _fetch_media_list(variables)
     return {"metas": metas, "hasNextPage": has_next}
 
+
 @app.get("/api/genres")
 async def api_genres():
     return [
@@ -289,6 +383,7 @@ async def api_genres():
         "Horror", "Mahou Shoujo", "Mecha", "Music", "Mystery", "Psychological",
         "Romance", "Sci-Fi", "Slice of Life", "Sports", "Supernatural", "Thriller"
     ]
+
 
 @app.get("/api/search")
 async def api_search(q: str):
@@ -309,6 +404,7 @@ async def api_search(q: str):
              "poster": m["coverImage"]["large"], "episodes": m.get("episodes") or 0,
              "year": m.get("seasonYear"), "genres": m.get("genres", []),
              "score": m.get("averageScore")} for m in media]
+
 
 @app.get("/api/episodes/{anilist_id}")
 async def api_episodes(anilist_id: str):
@@ -337,6 +433,7 @@ async def api_episodes(anilist_id: str):
         if next_ep and next_ep.get("episode"):
             total = next_ep["episode"] - 1
     return {"total": max(total or 0, 0)}
+
 
 @app.get("/api/anime/{anilist_id}")
 async def anime_details(anilist_id: str):
@@ -429,12 +526,9 @@ async def anime_details(anilist_id: str):
 
     return media
 
+
 @app.get("/stream/{anilist_id}/{episode}")
-async def stream_endpoint(
-    anilist_id: str,
-    episode: int,
-    req: Request
-):
+async def stream_endpoint(anilist_id: str, episode: int, req: Request):
     clean = anilist_id.replace("anilist:", "")
     try:
         aid = int(clean)
@@ -443,51 +537,27 @@ async def stream_endpoint(
         return {"streams": []}
 
     base = str(req.base_url).rstrip("/")
+    cache_key = f"{aid}:{episode}"
 
-    async def fetch_stream_for_lang(lang: str) -> Optional[dict]:
-        data = await fetch_megavid(aid, episode, lang)
-        if not data:
-            return None
+    async with state.cache_lock:
+        cached = state.stream_cache.get(cache_key)
+        if cached and (time.time() - cached["ts"]) < cached.get("ttl", Config.CACHE_TTL):
+            return cached["payload"]
 
-        source = data.get("source")
-        if not source:
-            return None
+        if cache_key in state.in_flight:
+            task = state.in_flight[cache_key]
+        else:
+            task = asyncio.create_task(_fetch_and_cache_stream(aid, episode, base, cache_key))
+            state.in_flight[cache_key] = task
 
-        proxy_url = f"{base}/proxy/m3u8?url={quote(source)}&referer={quote(Config.MEGAVID_REFERER)}"
-        label = "English Dub" if lang == "dub" else "Japanese Sub"
-        stream_obj = {"name": label, "url": proxy_url}
+    try:
+        result = await task
+        return result
+    finally:
+        async with state.cache_lock:
+            if state.in_flight.get(cache_key) is task:
+                state.in_flight.pop(cache_key, None)
 
-        tracks = data.get("tracks") or []
-        if tracks:
-            stream_obj["subtitles"] = [
-                {
-                    "url": f"{base}/proxy/sub?url={quote(t['file'])}",
-                    "lang": t.get("label", "eng")
-                }
-                for t in tracks if t.get("file")
-            ]
-
-        hints = {}
-        intro = data.get("intro")
-        outro = data.get("outro")
-
-        if intro and isinstance(intro, dict) and "start" in intro and "end" in intro:
-            hints["skipIntroTimestamps"] = [intro["start"], intro["end"]]
-        if outro and isinstance(outro, dict) and "start" in outro and "end" in outro:
-            hints["skipOutroTimestamps"] = [outro["start"], outro["end"]]
-
-        if hints:
-            stream_obj["behaviorHints"] = hints
-
-        return stream_obj
-
-    # Fetch sub and dub in parallel directly using AniList ID
-    sub_task = asyncio.create_task(fetch_stream_for_lang("sub"))
-    dub_task = asyncio.create_task(fetch_stream_for_lang("dub"))
-    sub_stream, dub_stream = await asyncio.gather(sub_task, dub_task)
-
-    streams = [s for s in (sub_stream, dub_stream) if s is not None]
-    return {"streams": streams}
 
 # Proxy routes
 @app.get("/proxy/m3u8")
@@ -506,11 +576,13 @@ async def proxy_m3u8(url: str, referer: str, req: Request):
         if stripped.startswith("#"):
             if "#EXT-X-STREAM-INF" in stripped or "#EXT-I-FRAME-STREAM-INF" in stripped:
                 is_variant = True
+
             def rewrite_uri(m):
                 tag, raw = m.group(1), m.group(2)
                 full = urljoin(target, raw)
                 endpoint = "proxy/m3u8" if "EXT-X-MEDIA" in stripped else "proxy/segment"
                 return f'{tag}="{base}/{endpoint}?url={quote(full)}&referer={quote(ref)}"'
+
             line = re.sub(r'(URI)=["\']([^"\']+)["\']', rewrite_uri, stripped)
             rewritten.append(line)
         else:
@@ -521,21 +593,26 @@ async def proxy_m3u8(url: str, referer: str, req: Request):
     return Response("\n".join(rewritten), media_type="application/vnd.apple.mpegurl",
                     headers={"Access-Control-Allow-Origin": "*"})
 
+
 @app.get("/proxy/segment")
 async def segment(url: str, referer: str, req: Request):
     return await proxy_segment(unquote(url), unquote(referer), req)
+
 
 @app.get("/proxy/sub")
 async def sub_proxy(url: str):
     return await proxy_subtitle(unquote(url))
 
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return FileResponse(Config.TEMPLATES_DIR / "index.html")
 
+
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 async def catch_all(full_path: str):
     return FileResponse(Config.TEMPLATES_DIR / "index.html")
+
 
 if __name__ == "__main__":
     ssl_keyfile = os.getenv("SSL_KEYFILE")
